@@ -159,6 +159,16 @@ class ElasticECSHandler(logging.Handler):
         es_additional_fields=__DEFAULT_ADDITIONAL_FIELDS,
         es_additional_fields_in_env=__DEFAULT_ADDITIONAL_FIELDS_IN_ENV,
         raise_on_indexing_exceptions=__DEFAULT_RAISE_ON_EXCEPTION,
+        # Additional ES client settings for timeout/retry control
+        request_timeout=30,
+        max_retries=3,
+        retry_on_timeout=True,
+        retry_on_status=None,
+        ssl_context=None,
+        ca_certs=None,
+        client_cert=None,
+        client_key=None,
+        ssl_fingerprint=None,
     ):
         """Handler constructor
 
@@ -201,6 +211,15 @@ class ElasticECSHandler(logging.Handler):
                     no value for the field.
         :param raise_on_indexing_exceptions: A boolean, True only for debugging purposes to raise exceptions
                     caused when
+        :param request_timeout: Request timeout in seconds for Elasticsearch operations
+        :param max_retries: Maximum number of retries for failed requests
+        :param retry_on_timeout: Whether to retry on timeout errors
+        :param retry_on_status: Set of HTTP status codes to retry on (e.g., {502, 503, 504})
+        :param ssl_context: Custom SSL context for connections
+        :param ca_certs: Path to CA certificate file
+        :param client_cert: Path to client certificate file
+        :param client_key: Path to client private key file
+        :param ssl_fingerprint: Expected SSL certificate fingerprint
         :return: A ready to be used ElasticECSHandler.
         """
         logging.Handler.__init__(self)
@@ -243,6 +262,17 @@ class ElasticECSHandler(logging.Handler):
 
         self.raise_on_indexing_exceptions = raise_on_indexing_exceptions
 
+        # Store ES client settings for timeout/retry control
+        self.request_timeout = request_timeout
+        self.max_retries = max_retries
+        self.retry_on_timeout = retry_on_timeout
+        self.retry_on_status = retry_on_status
+        self.ssl_context = ssl_context
+        self.ca_certs = ca_certs
+        self.client_cert = client_cert
+        self.client_key = client_key
+        self.ssl_fingerprint = ssl_fingerprint
+
         self._client = None
         self._buffer = []
         self._buffer_lock = Lock()
@@ -255,47 +285,71 @@ class ElasticECSHandler(logging.Handler):
             self._timer = Timer(self.flush_frequency_in_sec, self.flush)
             self._timer.setDaemon(True)
             self._timer.start()
+    
+    def __get_es_client_kwargs(self):
+        """Build kwargs for Elasticsearch client with all configured settings."""
+        kwargs = {
+            'hosts': self.hosts,
+            'verify_certs': self.verify_certs,
+            'serializer': self.serializer,
+        }
+        
+        # Add timeout and retry settings
+        if self.request_timeout is not None:
+            kwargs['request_timeout'] = self.request_timeout
+        if self.max_retries is not None:
+            kwargs['max_retries'] = self.max_retries
+        if self.retry_on_timeout is not None:
+            kwargs['retry_on_timeout'] = self.retry_on_timeout
+        if self.retry_on_status is not None:
+            kwargs['retry_on_status'] = self.retry_on_status
+            
+        # Add SSL settings
+        if self.ssl_context is not None:
+            kwargs['ssl_context'] = self.ssl_context
+        if self.ca_certs is not None:
+            kwargs['ca_certs'] = self.ca_certs
+        if self.client_cert is not None:
+            kwargs['client_cert'] = self.client_cert
+        if self.client_key is not None:
+            kwargs['client_key'] = self.client_key
+        if self.ssl_fingerprint is not None:
+            kwargs['ssl_fingerprint'] = self.ssl_fingerprint
+            
+        return kwargs
 
     def __get_es_client(self):
         if self.auth_type == ElasticECSHandler.AuthType.NO_AUTH:
             if self._client is None:
-                self._client = Elasticsearch(
-                    hosts=self.hosts, verify_certs=self.verify_certs, serializer=self.serializer
-                )
+                kwargs = self.__get_es_client_kwargs()
+                self._client = Elasticsearch(**kwargs)
             return self._client
 
         if self.auth_type == ElasticECSHandler.AuthType.BASIC_AUTH:
             if self._client is None:
-                self._client = Elasticsearch(
-                    hosts=self.hosts,
-                    basic_auth=self.auth_details,
-                    verify_certs=self.verify_certs,
-                    serializer=self.serializer,
-                )
+                kwargs = self.__get_es_client_kwargs()
+                kwargs['basic_auth'] = self.auth_details
+                self._client = Elasticsearch(**kwargs)
             return self._client
 
         if self.auth_type == ElasticECSHandler.AuthType.KERBEROS_AUTH:
             if not CMR_KERBEROS_SUPPORTED:
                 raise EnvironmentError('Kerberos module not available. Please install "requests-kerberos"')
             # For kerberos we return a new client each time to make sure the tokens are up to date
-            return Elasticsearch(
-                hosts=self.hosts,
-                verify_certs=self.verify_certs,
-                basic_auth=HTTPKerberosAuth(mutual_authentication=DISABLED),
-                serializer=self.serializer,
-            )
+            kwargs = self.__get_es_client_kwargs()
+            kwargs['basic_auth'] = HTTPKerberosAuth(mutual_authentication=DISABLED)
+            return Elasticsearch(**kwargs)
 
         if self.auth_type == ElasticECSHandler.AuthType.AWS_SIGNED_AUTH:
             if not AWS4AUTH_SUPPORTED:
                 raise EnvironmentError('AWS4Auth not available. Please install "requests-aws4auth"')
             if self._client is None:
                 awsauth = AWS4Auth(self.aws_access_key, self.aws_secret_key, self.aws_region, "es")
-                self._client = Elasticsearch(
-                    hosts=self.hosts,
-                    basic_auth=awsauth,
-                    verify_certs=True,
-                    serializer=self.serializer,
-                )
+                kwargs = self.__get_es_client_kwargs()
+                kwargs['basic_auth'] = awsauth
+                # Override verify_certs for AWS (was hardcoded to True)
+                kwargs['verify_certs'] = True
+                self._client = Elasticsearch(**kwargs)
             return self._client
 
         raise ValueError("Authentication method not supported")
